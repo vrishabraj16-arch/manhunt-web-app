@@ -1,55 +1,40 @@
 const express = require("express");
-const http = require("http");
+const http    = require("http");
 const { Server } = require("socket.io");
-const crypto = require("crypto");
 
-const app = express();
+// ─── App bootstrap ────────────────────────────────────────────────────────────
+const app    = express();
 const server = http.createServer(app);
-const io = new Server(server);
-const PORT = process.env.PORT || 3000;
+const io     = new Server(server, { pingTimeout: 30000, pingInterval: 10000 });
+const PORT   = process.env.PORT || 3000;
 
 app.use(express.static("public"));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
-// In-memory rooms: suitable for a small game/demo. Rooms reset when server restarts.
+// ─── In-memory store ──────────────────────────────────────────────────────────
 const rooms = new Map();
 
-// IP-based session persistence: maps "ip:roomCode" -> session object
-// Sessions expire 2 hours after the player disconnects.
-const ipSessions = new Map();
-
+// ─── Pure helpers (no side-effects) ──────────────────────────────────────────
 const cleanName = (v, max = 24) => String(v || "").trim().slice(0, max);
-const roomCode = (v) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 12);
-const safeNum = (v, min, max, fallback) => {
+const toRoomCode = (v) => String(v || "").trim().toUpperCase().replace(/[^A-Z0-9-]/g, "").slice(0, 12);
+const clamp = (v, min, max, fallback) => {
   const n = Number(v);
   return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
 };
+const isValidCoord = (lat, lon) =>
+  Number.isFinite(lat) && Number.isFinite(lon) &&
+  lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180;
 
-/** Generate a unique 4-digit PIN not already in use within this room. */
-function generatePin(room) {
-  let pin;
-  const usedPins = new Set([...room.players.values()].map(p => p.pin).filter(Boolean));
-  do {
-    pin = String(Math.floor(1000 + Math.random() * 9000));
-  } while (usedPins.has(pin));
-  return pin;
+/** Generate a unique 4-digit code for a hider within the room. */
+function generateCatchCode(room) {
+  const used = new Set([...room.players.values()].map(p => p.catchCode).filter(Boolean));
+  let code, attempts = 0;
+  do { code = String(Math.floor(1000 + Math.random() * 9000)); } while (used.has(code) && ++attempts < 200);
+  return code;
 }
 
-/** Normalize an IPv6-mapped IPv4 address (::ffff:1.2.3.4 → 1.2.3.4). */
-function normalizeIP(ip) {
-  if (!ip) return "unknown";
-  return ip.startsWith("::ffff:") ? ip.slice(7) : ip;
-}
-
-/** Key used for ipSessions map. */
-function sessionKey(ip, code) {
-  return `${ip}:${code}`;
-}
-
-/**
- * Public view of a player (sent to all clients).
- * Includes caught status; PIN is intentionally omitted for privacy.
- */
+// ─── Serialisers ──────────────────────────────────────────────────────────────
+/** Strip server-only fields before sending a player to clients. */
 function publicPlayer(p) {
   return {
     id: p.id,
@@ -58,358 +43,398 @@ function publicPlayer(p) {
     connected: p.connected,
     hasLocation: !!p.location,
     lastSeen: p.lastSeen || null,
-    caught: !!p.caught
+    caught: !!p.caught,
+    caughtBy: p.caughtBy || null,
+    caughtAt: p.caughtAt || null
   };
 }
 
 function roomState(room) {
+  const players       = [...room.players.values()].map(publicPlayer);
+  const totalHiders   = players.filter(p => p.team === "hiders").length;
+  const uncaughtHiders = players.filter(p => p.team === "hiders" && !p.caught).length;
   return {
     code: room.code,
     status: room.status,
     settings: room.settings,
     startedAt: room.startedAt,
     endsAt: room.endsAt,
-    players: [...room.players.values()].map(publicPlayer)
+    players,
+    totalHiders,
+    uncaughtHiders
   };
 }
 
-function emitRoom(room) {
-  io.to(room.code).emit("room-state", roomState(room));
-}
+const emitRoom = (room) => io.to(room.code).emit("room-state", roomState(room));
 
+// ─── Room factory ─────────────────────────────────────────────────────────────
 function ensureRoom(code) {
-  let room = rooms.get(code);
-  if (!room) {
-    room = {
+  if (!rooms.has(code)) {
+    rooms.set(code, {
       code,
       status: "lobby",
       players: new Map(),
-      settings: { durationMin: 30, hiderPingSec: 60, seekerPingSec: 120 },
+      caughtDeviceIds: new Set(),
+      caughtPlayers: [],
+      settings: {
+        durationMin: 30,
+        hiderPingSec: 30,   // how often HIDERS' locations are broadcast
+        seekerPingSec: 60   // how often SEEKERS' locations are broadcast
+      },
       startedAt: null,
       endsAt: null,
-      pingTimers: {},
-      endTimer: null
-    };
-    rooms.set(code, room);
+      pingTimers: { hiders: null, seekers: null },
+      endTimer: null,
+      resetTimer: null
+    });
   }
-  return room;
+  return rooms.get(code);
 }
 
+// ─── Ping engine ──────────────────────────────────────────────────────────────
 function clearPings(room) {
-  for (const timer of Object.values(room.pingTimers)) clearInterval(timer);
-  room.pingTimers = {};
+  for (const key of Object.keys(room.pingTimers)) {
+    if (room.pingTimers[key]) { clearInterval(room.pingTimers[key]); room.pingTimers[key] = null; }
+  }
 }
 
 /**
- * Broadcast the location of all (non-caught) players on `teamWithLocation`
- * to every player on the opposing team.
- * Caught hiders are excluded from pings.
+ * Broadcast all players' locations.
+ * @param {object} room
+ * @param {string|null} teamFilter - if set, only include that team's locations in this ping
  */
-function broadcastPings(room, teamWithLocation) {
+function broadcastLocations(room, teamFilter = null) {
   if (room.status !== "playing") return;
-  const recipientsTeam = teamWithLocation === "hiders" ? "seekers" : "hiders";
-  const players = [...room.players.values()];
-  const locations = players
-    .filter(p => p.team === teamWithLocation && p.location && !p.caught)
+  const locations = [...room.players.values()]
+    .filter(p => p.location && !p.caught && (!teamFilter || p.team === teamFilter))
     .map(p => ({
       id: p.id, username: p.username, team: p.team,
+      caught: !!p.caught, caughtBy: p.caughtBy || null,
       lat: p.location.lat, lon: p.location.lon,
       accuracy: p.location.accuracy, capturedAt: p.location.capturedAt
     }));
-  // Only the opposing team receives the coordinates.
-  for (const p of players) {
-    if (p.team === recipientsTeam && !p.caught) {
-      io.to(p.id).emit("location-ping", {
-        sourceTeam: teamWithLocation,
-        locations,
-        sentAt: Date.now(),
-        nextPingSec: teamWithLocation === "hiders"
-          ? room.settings.hiderPingSec : room.settings.seekerPingSec
-      });
-    }
-  }
+
+  io.to(room.code).emit("location-ping", {
+    locations,
+    teamFilter,          // lets the client label the ping (e.g. "Hider locations updated")
+    sentAt: Date.now(),
+    hiderPingSec: room.settings.hiderPingSec,
+    seekerPingSec: room.settings.seekerPingSec
+  });
 }
 
+/**
+ * Start two independent ping timers — one for hider locations, one for seeker locations.
+ * Both are broadcast to everyone in the room.
+ */
 function startPings(room) {
   clearPings(room);
-  // First ping happens immediately, then repeats at the configured interval.
-  broadcastPings(room, "hiders");
-  broadcastPings(room, "seekers");
+
+  // Immediate first ping for both teams
+  broadcastLocations(room, "hiders");
+  broadcastLocations(room, "seekers");
+
   room.pingTimers.hiders = setInterval(
-    () => broadcastPings(room, "hiders"), room.settings.hiderPingSec * 1000
+    () => broadcastLocations(room, "hiders"),
+    room.settings.hiderPingSec * 1000
   );
   room.pingTimers.seekers = setInterval(
-    () => broadcastPings(room, "seekers"), room.settings.seekerPingSec * 1000
+    () => broadcastLocations(room, "seekers"),
+    room.settings.seekerPingSec * 1000
   );
 }
 
-function endGame(room) {
-  clearPings(room);
-  room.status = "ended";
-  emitRoom(room);
-  io.to(room.code).emit("game-ended", { message: "Game time is up." });
-  // Clean up all IP sessions for this room when it ends.
-  for (const [key] of ipSessions) {
-    if (key.endsWith(`:${room.code}`)) {
-      ipSessions.delete(key);
-    }
+// ─── Auto-end checks after disconnect/leave ───────────────────────────────────
+/**
+ * After a player leaves/disconnects, check if the game should auto-end.
+ * Called only when room.status === "playing".
+ */
+function checkAutoEnd(room) {
+  if (room.status !== "playing") return;
+
+  const allPlayers = [...room.players.values()];
+  const allHiders  = allPlayers.filter(p => p.team === "hiders");
+  const allSeekers = allPlayers.filter(p => p.team === "seekers");
+
+  // No seekers left → hiders win by default
+  if (allSeekers.length === 0) {
+    endGame(room, "All seekers left — Hiders win by default!");
+    return;
+  }
+
+  // No hiders left at all (all disconnected)
+  if (allHiders.length === 0) {
+    endGame(room, "All hiders left — Game over!");
+    return;
+  }
+
+  // All remaining hiders are caught → seekers win
+  const uncaughtHiders = allHiders.filter(p => !p.caught);
+  if (uncaughtHiders.length === 0) {
+    endGame(room, "All hiders caught — Seekers win!");
+    return;
   }
 }
 
-/** Save a player's session so they can rejoin as the same person after a disconnect. */
-function saveSession(ip, code, player) {
-  const key = sessionKey(ip, code);
-  // Cancel any existing cleanup timer for this key.
-  const existing = ipSessions.get(key);
-  if (existing && existing._cleanupTimer) clearTimeout(existing._cleanupTimer);
+// ─── Game end ─────────────────────────────────────────────────────────────────
+function endGame(room, customMessage = null) {
+  clearPings(room);
+  if (room.endTimer) { clearTimeout(room.endTimer); room.endTimer = null; }
 
-  const session = {
-    username: player.username,
-    team: player.team,
-    location: player.location,
-    pin: player.pin || null,
-    caught: player.caught || false,
-    lastSeen: Date.now(),
-    _cleanupTimer: null
-  };
-  // Auto-delete session after 2 hours.
-  session._cleanupTimer = setTimeout(() => ipSessions.delete(key), 7200000);
-  ipSessions.set(key, session);
+  // Clear any existing reset timer to avoid double-resets
+  if (room.resetTimer) { clearTimeout(room.resetTimer); room.resetTimer = null; }
+
+  room.status = "ended";
+  emitRoom(room);
+
+  let message = customMessage;
+  let winner  = null;
+  if (!message) {
+    const alive = [...room.players.values()].filter(p => p.team === "hiders" && !p.caught);
+    if (alive.length > 0) {
+      winner = "hiders";
+      message = `⏰ Time's up! Hiders win — ${alive.length} hider${alive.length > 1 ? "s" : ""} survived (${alive.map(h => h.username).join(", ")}).`;
+    } else {
+      winner = "seekers";
+      message = "⏰ Time's up! All hiders caught — Seekers win!";
+    }
+  }
+  io.to(room.code).emit("game-ended", { message, winner });
+
+  // Schedule room reset after 30 seconds
+  room.resetTimer = setTimeout(() => {
+    // Only reset if the room still exists and is still "ended"
+    if (!rooms.has(room.code) || room.status !== "ended") return;
+
+    // Reset room state to lobby
+    room.status    = "lobby";
+    room.startedAt = null;
+    room.endsAt    = null;
+    room.endTimer  = null;
+    room.resetTimer = null;
+
+    // Clear caught tracking
+    room.caughtDeviceIds = new Set();
+    room.caughtPlayers   = [];
+
+    // Reset all players' caught state and assign new catch codes to hiders
+    for (const p of room.players.values()) {
+      p.caught    = false;
+      p.caughtBy  = null;
+      p.caughtAt  = null;
+      p.location  = null;
+      if (p.team === "hiders") {
+        p.catchCode = generateCatchCode(room);
+      }
+    }
+
+    // Emit updated room-state so everyone sees the lobby
+    emitRoom(room);
+
+    // Emit room-reset event
+    io.to(room.code).emit("room-reset", {
+      message: "Room has reset to lobby. You can play again!"
+    });
+
+    // Send each hider their new catch code individually
+    for (const p of room.players.values()) {
+      if (p.team === "hiders" && p.catchCode) {
+        io.to(p.id).emit("new-catch-code", { catchCode: p.catchCode });
+      }
+    }
+  }, 30000);
 }
 
-// ─── Socket.io event handlers ─────────────────────────────────────────────────
+// ─── Cleanup a room if empty ──────────────────────────────────────────────────
+function cleanupRoomIfEmpty(room) {
+  if (room.players.size === 0) {
+    clearPings(room);
+    if (room.endTimer)   clearTimeout(room.endTimer);
+    if (room.resetTimer) clearTimeout(room.resetTimer);
+    rooms.delete(room.code);
+  }
+}
 
+// ─── Socket handlers ──────────────────────────────────────────────────────────
 io.on("connection", socket => {
-  // Extract and normalize the connecting client's IP address.
-  const rawIP = socket.handshake.address || socket.request.socket.remoteAddress || "unknown";
-  const clientIP = normalizeIP(rawIP);
 
+  // ── join-room ───────────────────────────────────────────────────────────────
   socket.on("join-room", (data, cb = () => {}) => {
-    const code = roomCode(data?.room);
-    let username = cleanName(data?.username);
-    let team = data?.team === "seekers" ? "seekers" : "hiders";
-    if (!code || code.length < 3) return cb({ ok: false, error: "Room ID must be at least 3 letters/numbers." });
-    if (!username) return cb({ ok: false, error: "Enter a username." });
+    const code     = toRoomCode(data?.room);
+    const username = cleanName(data?.username);
+    const team     = data?.team === "seekers" ? "seekers" : "hiders";
+    const deviceId = String(data?.deviceId || "").trim().slice(0, 64);
 
-    // Leave any previous room cleanly.
+    if (code.length < 3)  return cb({ ok: false, error: "Room ID must be at least 3 characters." });
+    if (!username)        return cb({ ok: false, error: "Enter a username." });
+
+    // Leave previous room cleanly
     if (socket.data.room) {
       const old = rooms.get(socket.data.room);
       if (old) {
         old.players.delete(socket.id);
         emitRoom(old);
-        if (old.players.size === 0) { clearPings(old); rooms.delete(old.code); }
+        cleanupRoomIfEmpty(old);
       }
       socket.leave(socket.data.room);
     }
 
     const room = ensureRoom(code);
-    if (room.status === "ended") return cb({ ok: false, error: "This game has ended. Create a new room ID." });
+    if (room.status === "ended") return cb({ ok: false, error: "This game has ended. Use a new room ID." });
 
-    // ── IP session restoration ────────────────────────────────────────────────
-    const key = sessionKey(clientIP, code);
-    const session = ipSessions.get(key);
-    let restoredSession = false;
+    // Anti-rejoin: device fingerprint check
+    if (deviceId && room.caughtDeviceIds.has(deviceId))
+      return cb({ ok: false, error: "You were caught in this game and cannot rejoin, even with another name!" });
 
-    if (session) {
-      // Cancel the auto-cleanup timer; the player is back.
-      if (session._cleanupTimer) clearTimeout(session._cleanupTimer);
-      ipSessions.delete(key); // We'll re-save on next disconnect if needed.
-      // Restore from session (username/team/pin/caught/location from saved state).
-      username = session.username;
-      team = session.team;
-      restoredSession = true;
-    }
+    // Anti-rejoin: username check
+    if (room.caughtPlayers.some(cp => cp.username.toLowerCase() === username.toLowerCase()))
+      return cb({ ok: false, error: "This player was already caught and cannot rejoin!" });
 
-    // Remove any stale socket entry for this logical player (same IP+room).
-    // This handles the case where the old socket is still technically present.
-    for (const [sid, p] of room.players) {
-      if (p._ip === clientIP) {
-        room.players.delete(sid);
-        break;
-      }
-    }
-
-    // Assign a PIN to hiders (restore from session if available, else generate fresh).
-    let pin = null;
-    if (team === "hiders") {
-      pin = (restoredSession && session.pin) ? session.pin : generatePin(room);
-    }
-
+    const catchCode = team === "hiders" ? generateCatchCode(room) : null;
     const player = {
-      id: socket.id,
-      _ip: clientIP,          // internal — not sent to clients
-      username,
-      team,
-      connected: true,
-      location: (restoredSession && session.location) ? session.location : null,
-      caught: restoredSession ? (session.caught || false) : false,
-      pin,                    // only for hiders
-      lastSeen: Date.now()
+      id: socket.id, username, team, deviceId,
+      connected: true, location: null, lastSeen: Date.now(),
+      caught: false, catchCode
     };
 
     room.players.set(socket.id, player);
     socket.join(code);
-    socket.data.room = code;
+    socket.data.room     = code;
+    socket.data.deviceId = deviceId;
+    socket.data.team     = team;
 
-    // Tell the joining player their own PIN (hiders only) and whether session was restored.
-    cb({
-      ok: true,
-      state: roomState(room),
-      playerId: socket.id,
-      team: player.team,
-      pin: player.pin || null,       // null for seekers
-      restored: restoredSession
-    });
+    cb({ ok: true, state: roomState(room), playerId: socket.id, catchCode });
     emitRoom(room);
 
     if (room.status === "playing") {
       socket.emit("game-already-playing", {
-        startedAt: room.startedAt,
-        endsAt: room.endsAt,
-        settings: room.settings
+        startedAt: room.startedAt, endsAt: room.endsAt, settings: room.settings
       });
+      // Give the late joiner an immediate location snapshot
+      broadcastLocations(room, "hiders");
+      broadcastLocations(room, "seekers");
     }
   });
 
+  // ── update-settings ─────────────────────────────────────────────────────────
   socket.on("update-settings", (data, cb = () => {}) => {
     const room = rooms.get(socket.data.room);
-    if (!room) return cb({ ok: false, error: "Join a room first." });
-    if (room.status !== "lobby") return cb({ ok: false, error: "Settings can only be changed in the lobby." });
+    if (!room)                       return cb({ ok: false, error: "Join a room first." });
+    if (room.status !== "lobby")     return cb({ ok: false, error: "Settings can only change in the lobby." });
+
     room.settings = {
-      durationMin: safeNum(data?.durationMin, 1, 240, 30),
-      hiderPingSec: safeNum(data?.hiderPingSec, 10, 3600, 60),
-      seekerPingSec: safeNum(data?.seekerPingSec, 10, 3600, 120)
+      durationMin:  clamp(data?.durationMin, 1, 240, 30),
+      hiderPingSec: clamp(data?.hiderPingSec, 5, 3600, 30),
+      seekerPingSec: clamp(data?.seekerPingSec, 5, 3600, 60)
     };
     emitRoom(room);
     cb({ ok: true });
   });
 
+  // ── start-game ──────────────────────────────────────────────────────────────
   socket.on("start-game", (_data, cb = () => {}) => {
     const room = rooms.get(socket.data.room);
-    if (!room) return cb({ ok: false, error: "Join a room first." });
-    if (room.status !== "lobby") return cb({ ok: false, error: "Game has already started." });
-    const hiders = [...room.players.values()].filter(p => p.team === "hiders").length;
+    if (!room)                   return cb({ ok: false, error: "Join a room first." });
+    if (room.status !== "lobby") return cb({ ok: false, error: "Game already started." });
+
+    const hiders  = [...room.players.values()].filter(p => p.team === "hiders").length;
     const seekers = [...room.players.values()].filter(p => p.team === "seekers").length;
-    if (!hiders || !seekers) return cb({ ok: false, error: "You need at least one hider and one seeker to start." });
-    room.status = "playing";
+    if (!hiders || !seekers)
+      return cb({ ok: false, error: "Need at least one hider and one seeker to start." });
+
+    room.status    = "playing";
     room.startedAt = Date.now();
-    room.endsAt = room.startedAt + room.settings.durationMin * 60 * 1000;
+    room.endsAt    = room.startedAt + room.settings.durationMin * 60_000;
+    room.endTimer  = setTimeout(() => endGame(room), room.settings.durationMin * 60_000);
     startPings(room);
     emitRoom(room);
-    room.endTimer = setTimeout(() => endGame(room), room.settings.durationMin * 60 * 1000);
     cb({ ok: true });
   });
 
+  // ── location-update ─────────────────────────────────────────────────────────
   socket.on("location-update", data => {
     const room = rooms.get(socket.data.room);
     if (!room || room.status !== "playing") return;
     const p = room.players.get(socket.id);
-    if (!p || p.caught) return; // Caught players no longer share location.
-    if (!Number.isFinite(Number(data?.lat)) || !Number.isFinite(Number(data?.lon))) return;
-    const lat = Number(data.lat), lon = Number(data.lon);
-    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return;
-    p.location = {
-      lat, lon,
-      accuracy: safeNum(data.accuracy, 0, 100000, 0),
-      capturedAt: Date.now()
-    };
-    p.lastSeen = Date.now();
+    if (!p) return;
 
-    // ── Teammate real-time location sharing ────────────────────────────────
-    // Broadcast this player's location immediately to their own teammates only.
-    const teammateLoc = {
-      id: p.id, username: p.username, team: p.team,
-      lat: p.location.lat, lon: p.location.lon,
-      accuracy: p.location.accuracy, capturedAt: p.location.capturedAt
-    };
-    for (const teammate of room.players.values()) {
-      if (teammate.id !== socket.id && teammate.team === p.team && !teammate.caught) {
-        io.to(teammate.id).emit("teammate-location", teammateLoc);
-      }
-    }
-    // Opposing-team coordinates are NOT broadcast immediately; they go out on the scheduled ping timer.
+    const lat = Number(data?.lat), lon = Number(data?.lon);
+    if (!isValidCoord(lat, lon)) return;
+
+    p.location = { lat, lon, accuracy: clamp(data?.accuracy, 0, 100_000, 0), capturedAt: Date.now() };
+    p.lastSeen = Date.now();
   });
 
-  /**
-   * catch-hider: A seeker submits a PIN to catch a hider.
-   * Payload: { pin: "1234" }
-   * Response: { ok: true, caughtPlayer: { username, team } } | { ok: false, error: "..." }
-   */
+  // ── catch-hider ─────────────────────────────────────────────────────────────
   socket.on("catch-hider", (data, cb = () => {}) => {
     const room = rooms.get(socket.data.room);
-    if (!room) return cb({ ok: false, error: "Join a room first." });
-    if (room.status !== "playing") return cb({ ok: false, error: "Game is not currently active." });
+    if (!room)                        return cb({ ok: false, error: "Join a room first." });
+    if (room.status !== "playing")    return cb({ ok: false, error: "Game is not active." });
 
-    const catcher = room.players.get(socket.id);
-    if (!catcher || catcher.team !== "seekers") return cb({ ok: false, error: "Only seekers can catch hiders." });
+    const seeker = room.players.get(socket.id);
+    if (!seeker || seeker.team !== "seekers")
+      return cb({ ok: false, error: "Only seekers can catch hiders." });
 
-    const pin = String(data?.pin || "").trim();
-    if (!/^\d{4}$/.test(pin)) return cb({ ok: false, error: "PIN must be a 4-digit number." });
+    const input = String(data?.code || "").trim();
+    if (!input) return cb({ ok: false, error: "Enter the hider's 4-digit code." });
 
-    // Find the hider with this PIN.
-    let target = null;
-    for (const p of room.players.values()) {
-      if (p.team === "hiders" && p.pin === pin && !p.caught) {
-        target = p;
-        break;
-      }
-    }
-    if (!target) return cb({ ok: false, error: "Invalid PIN or hider already caught." });
+    const hider = [...room.players.values()].find(
+      p => p.team === "hiders" && p.catchCode && p.catchCode === input
+    );
+    if (!hider)        return cb({ ok: false, error: "Invalid code — no matching hider." });
+    if (hider.caught)  return cb({ ok: false, error: `${hider.username} is already caught!` });
 
-    // Mark as caught.
-    target.caught = true;
-    target.location = null; // Stop sharing their location.
+    // Mark caught
+    hider.caught    = true;
+    hider.caughtBy  = seeker.username;
+    hider.caughtAt  = Date.now();
+    hider.location  = null;  // terminate their GPS ping immediately
 
-    // Tell the caught hider directly.
-    io.to(target.id).emit("you-were-caught", {
-      message: "You have been caught! You are out.",
-      caughtBy: catcher.username
+    if (hider.deviceId) room.caughtDeviceIds.add(hider.deviceId);
+    room.caughtPlayers.push({ username: hider.username, deviceId: hider.deviceId, caughtAt: hider.caughtAt, caughtBy: seeker.username });
+
+    io.to(hider.id).emit("you-are-caught", { caughtBy: seeker.username, caughtAt: hider.caughtAt });
+
+    const allHiders     = [...room.players.values()].filter(p => p.team === "hiders");
+    const uncaughtHiders = allHiders.filter(p => !p.caught);
+
+    io.to(room.code).emit("player-caught", {
+      hiderId: hider.id, hiderName: hider.username, seekerName: seeker.username,
+      caughtAt: hider.caughtAt, uncaughtCount: uncaughtHiders.length, totalHiders: allHiders.length
     });
 
-    // Broadcast updated room state to everyone.
     emitRoom(room);
+    broadcastLocations(room, "hiders");
 
-    cb({ ok: true, caughtPlayer: { username: target.username, team: target.team } });
+    if (uncaughtHiders.length === 0)
+      endGame(room, `🎉 All hiders caught! Seekers win! (Last: ${hider.username})`);
+
+    cb({ ok: true, message: `You caught ${hider.username}! (${uncaughtHiders.length} hider${uncaughtHiders.length === 1 ? "" : "s"} left)` });
   });
 
+  // ── leave-room ──────────────────────────────────────────────────────────────
   socket.on("leave-room", () => {
-    const code = socket.data.room;
-    const room = rooms.get(code);
+    const room = rooms.get(socket.data.room);
     if (!room) return;
-    // When explicitly leaving, remove session too (no rejoin needed).
-    const key = sessionKey(clientIP, code);
-    const session = ipSessions.get(key);
-    if (session && session._cleanupTimer) clearTimeout(session._cleanupTimer);
-    ipSessions.delete(key);
-
+    const wasPlaying = room.status === "playing";
     room.players.delete(socket.id);
-    socket.leave(code);
+    socket.leave(socket.data.room);
     socket.data.room = null;
     emitRoom(room);
-    if (room.players.size === 0) {
-      clearPings(room);
-      if (room.endTimer) clearTimeout(room.endTimer);
-      rooms.delete(code);
-    }
+    if (wasPlaying) checkAutoEnd(room);
+    cleanupRoomIfEmpty(room);
   });
 
+  // ── disconnect ──────────────────────────────────────────────────────────────
   socket.on("disconnect", () => {
-    const code = socket.data.room;
-    const room = rooms.get(code);
+    const room = rooms.get(socket.data.room);
     if (!room) return;
-    const player = room.players.get(socket.id);
-    if (player) {
-      // Persist session for 2 hours so the player can rejoin as the same person.
-      saveSession(clientIP, code, player);
-      room.players.delete(socket.id);
-    }
+    const wasPlaying = room.status === "playing";
+    room.players.delete(socket.id);
     emitRoom(room);
-    if (room.players.size === 0) {
-      clearPings(room);
-      if (room.endTimer) clearTimeout(room.endTimer);
-      rooms.delete(code);
-    }
+    if (wasPlaying) checkAutoEnd(room);
+    cleanupRoomIfEmpty(room);
   });
 });
 
-server.listen(PORT, () => console.log(`Manhunt running on http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Manhunt running → http://localhost:${PORT}`));
